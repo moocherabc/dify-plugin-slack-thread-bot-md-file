@@ -243,6 +243,89 @@ class SlackEndpoint(Endpoint):
         except Exception:
             pass
 
+    def _dedupe_sort_messages(self, messages: List[Mapping]) -> List[Mapping]:
+        by_ts = {}
+        for m in messages:
+            ts = m.get("ts")
+            if ts is None:
+                continue
+            by_ts[str(ts)] = m
+
+        def sort_key(m):
+            try:
+                return float(m.get("ts", 0))
+            except (TypeError, ValueError):
+                return 0.0
+
+        return sorted(by_ts.values(), key=sort_key)
+
+    def _fetch_conversations_replies(
+        self, client: WebClient, channel: str, thread_ts: str
+    ) -> List[Mapping]:
+        try:
+            replies = client.conversations_replies(channel=channel, ts=thread_ts)
+            return replies.get("messages", [])
+        except SlackApiError as e:
+            if e.response.get("error") == "ratelimited":
+                retry_after = int(
+                    e.response.get("headers", {}).get("Retry-After", 60)
+                )
+                try:
+                    client.chat_postMessage(
+                        channel=channel,
+                        thread_ts=thread_ts,
+                        text=(
+                            "Rate limit reached when retrieving thread. "
+                            f"Retrying in {retry_after} seconds..."
+                        ),
+                    )
+                except SlackApiError:
+                    pass
+                time.sleep(retry_after)
+                try:
+                    replies = client.conversations_replies(
+                        channel=channel, ts=thread_ts
+                    )
+                    return replies.get("messages", [])
+                except SlackApiError as retry_err:
+                    print(f"Error getting thread history after retry: {retry_err}")
+                    return []
+            print(f"Error getting thread history: {e}")
+            return []
+
+    def _ensure_thread_messages_with_parent(
+        self,
+        client: WebClient,
+        channel: str,
+        thread_ts: str,
+        messages: List[Mapping],
+    ) -> List[Mapping]:
+        """
+        Ensure the thread parent (ts == thread_ts) is present. Prefer cache to avoid
+        Slack rate limits, but fetch conversations.replies when the parent is missing.
+        """
+        messages = list(messages or [])
+        has_parent = any(str(m.get("ts")) == str(thread_ts) for m in messages)
+        if messages and has_parent:
+            return self._dedupe_sort_messages(messages)
+
+        fetched = self._fetch_conversations_replies(client, channel, thread_ts)
+        by_ts = {
+            str(m["ts"]): m for m in messages if m.get("ts") is not None
+        }
+        for m in fetched:
+            ts = m.get("ts")
+            if ts is None:
+                continue
+            ts = str(ts)
+            if ts not in by_ts:
+                by_ts[ts] = m
+                self._append_thread_message(channel, thread_ts, m)
+            elif ts == str(thread_ts):
+                by_ts[ts] = m
+
+        return self._dedupe_sort_messages(list(by_ts.values()))
+
     def _post_pending_message(
         self, client: WebClient, channel: str, thread_ts: str
     ) -> Optional[str]:
@@ -449,43 +532,16 @@ class SlackEndpoint(Endpoint):
                     # Get thread history for better context
                     thread_history = []
                     user_id_list = []
+                    user_display_name_map = {}
+                    # Preserve first-reply broadcast: first Dify turn for this thread.
+                    is_first_bot_reply = conversation_id is None
                     if thread_ts:
-                        messages = self._load_cached_history(channel, thread_ts)
-                        if not messages:
-                            try:
-                                replies = client.conversations_replies(
-                                    channel=channel, ts=thread_ts
-                                )
-                                messages = replies.get("messages", [])
-                            except SlackApiError as e:
-                                if e.response.get("error") == "ratelimited":
-                                    # Get retry-after header from Slack's response
-                                    retry_after = int(e.response.get("headers", {}).get("Retry-After", 60))
-                                    try:
-                                        client.chat_postMessage(
-                                            channel=channel,
-                                            thread_ts=thread_ts,
-                                            text=f"Rate limit reached when retrieving thread. Retrying in {retry_after} seconds...",
-                                        )
-                                    except SlackApiError:
-                                        pass
-                                    time.sleep(retry_after)
-                                    try:
-                                        replies = client.conversations_replies(
-                                            channel=channel, ts=thread_ts
-                                        )
-                                        messages = replies.get("messages", [])
-                                    except SlackApiError as e:
-                                        print(
-                                            f"Error getting thread history after retry: {e}"
-                                        )
-                                        messages = []
-                                else:
-                                    print(f"Error getting thread history: {e}")
-                                    messages = []
-
-                            for m in messages:
-                                self._append_thread_message(channel, thread_ts, m)
+                        messages = self._ensure_thread_messages_with_parent(
+                            client,
+                            channel,
+                            thread_ts,
+                            self._load_cached_history(channel, thread_ts),
+                        )
 
                         # user list in the thread
                         # pattern to extract user id from slack message
@@ -512,7 +568,6 @@ class SlackEndpoint(Endpoint):
 
 
                         # get user display name map from user id list
-                        user_display_name_map = {}
                         try:
                             for user_id in user_id_list:
                                 user_info = client.users_info(user=user_id)
@@ -638,7 +693,7 @@ class SlackEndpoint(Endpoint):
                     try:
                         reply_broadcast = (
                             settings.get("first_reply_broadcast", False)
-                            and len(thread_history) == 1
+                            and is_first_bot_reply
                         )
                         upload_resp, filename = self._upload_answer_as_markdown(
                             client=client,

@@ -1,9 +1,13 @@
 import json
 import re
+import tempfile
 import traceback
+import uuid
 import requests
 import time
-from typing import Mapping, List, Tuple
+from datetime import datetime
+from pathlib import Path
+from typing import Mapping, List, Tuple, Optional
 from werkzeug import Request, Response
 from dify_plugin import Endpoint
 from slack_sdk import WebClient
@@ -238,6 +242,46 @@ class SlackEndpoint(Endpoint):
             self.session.storage.set(key, json.dumps(data).encode("utf-8"))
         except Exception:
             pass
+
+    def _upload_answer_as_markdown(
+        self,
+        client: WebClient,
+        channel: str,
+        thread_ts: str,
+        answer: Optional[str],
+        reply_broadcast: bool = False,
+    ):
+        """
+        Write the agent answer to a uniquely named markdown file, upload it to the
+        Slack thread, then delete the local file so concurrent sessions cannot collide.
+        """
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        filename = f"dify-reply-{stamp}-{uuid.uuid4().hex[:8]}.md"
+        path = Path(tempfile.gettempdir()) / filename
+        try:
+            path.write_text(answer or "", encoding="utf-8")
+
+            # files_upload_v2 cannot broadcast into the channel; announce once if needed.
+            if reply_broadcast:
+                client.chat_postMessage(
+                    channel=channel,
+                    thread_ts=thread_ts,
+                    text=f"Reply attached as `{filename}`",
+                    reply_broadcast=True,
+                )
+
+            return client.files_upload_v2(
+                channel=channel,
+                thread_ts=thread_ts,
+                file=str(path),
+                filename=filename,
+                title=filename,
+            ), filename
+        finally:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     def _invoke(self, r: Request, values: Mapping, settings: Mapping) -> Response:
         """
@@ -548,93 +592,35 @@ class SlackEndpoint(Endpoint):
                         )
 
                     try:
-                        converter = SlackMarkdownConverter()
-                        converted_answer = converter.convert(answer)
-
-                        # Slackで指定されている3,000文字以上の場合は分割
-                        # https://api.slack.com/reference/block-kit/composition-objects#text__fields
-                        MAX_MSG_LEN = 3000
-                        if len(converted_answer) > MAX_MSG_LEN:
-                            lines = converted_answer.split("\n")
-                            chunks = []
-                            current_chunk = ""
-
-                            for line in lines:
-                                # line自体がMAX_MSG_LENを超える場合を考慮
-                                if len(line) > MAX_MSG_LEN:
-                                    # lineをさらにサブ分割
-                                    sub_chunks = [
-                                        line[i : i + MAX_MSG_LEN]
-                                        for i in range(0, len(line), MAX_MSG_LEN)
-                                    ]
-                                    for sub in sub_chunks:
-                                        # current_chunk に積み上げられるなら積む
-                                        if (
-                                            len(current_chunk)
-                                            + (len(sub) + (1 if current_chunk else 0))
-                                            <= MAX_MSG_LEN
-                                        ):
-                                            if current_chunk:
-                                                current_chunk += "\n"
-                                            current_chunk += sub
-                                        else:
-                                            # 今のチャンクを確定させて次へ
-                                            chunks.append(current_chunk)
-                                            current_chunk = sub
-                                else:
-                                    # lineがMAX_MSG_LEN以内なら従来の行ごと処理
-                                    added_length = len(line) + (
-                                        1 if current_chunk else 0
-                                    )
-                                    if len(current_chunk) + added_length <= MAX_MSG_LEN:
-                                        if current_chunk:
-                                            current_chunk += "\n"
-                                        current_chunk += line
-                                    else:
-                                        chunks.append(current_chunk)
-                                        current_chunk = line
-
-                            # 最後に残っていたら追加
-                            if current_chunk:
-                                chunks.append(current_chunk)
-                        else:
-                            chunks = [converted_answer]
-
-                        # ブロードキャストするかどうか
                         reply_broadcast = (
                             settings.get("first_reply_broadcast", False)
                             and len(thread_history) == 1
                         )
-
-                        for i, chunk in enumerate(chunks):
-                            # 分割したチャンクを blocks に載せる
-                            answer_blocks = [
-                                {
-                                    "type": "section",
-                                    "text": {"type": "mrkdwn", "text": chunk},
-                                }
-                            ]
-                            # 2つ目以降のメッセージでブロードキャストされるとスレッド外にも大量に通知されてしまうので、
-                            # 必要に応じて一度目のみブロードキャストにする
-                            chunk_reply_broadcast = reply_broadcast if i == 0 else False
-
-                            resp = client.chat_postMessage(
-                                channel=channel,
-                                text=chunk,  # fallback用テキスト
-                                thread_ts=thread_ts,
-                                blocks=answer_blocks,
-                                reply_broadcast=chunk_reply_broadcast,
-                            )
-                            self._append_thread_message(
-                                channel,
-                                thread_ts,
-                                {
-                                    "ts": resp.get("ts"),
-                                    "text": chunk,
-                                    "user": resp.get("message", {}).get("user"),
-                                    "bot_id": resp.get("message", {}).get("bot_id"),
-                                },
-                            )
+                        upload_resp, filename = self._upload_answer_as_markdown(
+                            client=client,
+                            channel=channel,
+                            thread_ts=thread_ts,
+                            answer=answer,
+                            reply_broadcast=reply_broadcast,
+                        )
+                        files = upload_resp.get("files") or []
+                        file_info = files[0] if files else (upload_resp.get("file") or {})
+                        self._append_thread_message(
+                            channel,
+                            thread_ts,
+                            {
+                                "ts": str(
+                                    file_info.get("timestamp")
+                                    or file_info.get("created")
+                                    or thread_ts
+                                ),
+                                "text": answer or f"[markdown file: {filename}]",
+                                "user": None,
+                                "bot_id": "file_upload",
+                                "file_id": file_info.get("id"),
+                                "filename": filename,
+                            },
+                        )
 
                         return Response(
                             status=200, response="ok", content_type="text/plain"

@@ -243,6 +243,46 @@ class SlackEndpoint(Endpoint):
         except Exception:
             pass
 
+    def _post_pending_message(
+        self, client: WebClient, channel: str, thread_ts: str
+    ) -> Optional[str]:
+        """Post a temporary 'please wait' notice; returns message ts if successful."""
+        try:
+            resp = client.chat_postMessage(
+                channel=channel,
+                thread_ts=thread_ts,
+                text=":hourglass_flowing_sand: 已收到消息，正在努力生成回复…",
+            )
+            return resp.get("ts")
+        except SlackApiError as e:
+            print(f"Error posting pending message: {e}")
+            return None
+
+    def _clear_pending_message(
+        self, client: WebClient, channel: str, pending_ts: Optional[str]
+    ):
+        if not pending_ts:
+            return
+        try:
+            client.chat_delete(channel=channel, ts=pending_ts)
+        except SlackApiError:
+            pass
+
+    def _update_pending_message(
+        self,
+        client: WebClient,
+        channel: str,
+        pending_ts: Optional[str],
+        text: str,
+    ):
+        if not pending_ts:
+            return False
+        try:
+            client.chat_update(channel=channel, ts=pending_ts, text=text)
+            return True
+        except SlackApiError:
+            return False
+
     def _upload_answer_as_markdown(
         self,
         client: WebClient,
@@ -393,6 +433,7 @@ class SlackEndpoint(Endpoint):
                             status=200, response="ok", content_type="text/plain"
                         )
 
+                pending_ts = None
                 try:
                     # Create a key to check if the conversation already exists
                     key_to_check = f"slack-{channel}-{thread_ts}"
@@ -401,6 +442,9 @@ class SlackEndpoint(Endpoint):
                         conversation_id = self.session.storage.get(key_to_check)
                     except Exception as e:
                         err = traceback.format_exc()
+
+                    # Acknowledge early so users see feedback while the agent runs.
+                    pending_ts = self._post_pending_message(client, channel, thread_ts)
 
                     # Get thread history for better context
                     thread_history = []
@@ -621,12 +665,20 @@ class SlackEndpoint(Endpoint):
                                 "filename": filename,
                             },
                         )
+                        self._clear_pending_message(client, channel, pending_ts)
 
                         return Response(
                             status=200, response="ok", content_type="text/plain"
                         )
 
                     except SlackApiError as e:
+                        if not self._update_pending_message(
+                            client,
+                            channel,
+                            pending_ts,
+                            f":warning: 发送文件失败：{str(e)}",
+                        ):
+                            self._clear_pending_message(client, channel, pending_ts)
                         return Response(
                             status=200,
                             response=f"Error sending message to Slack: {str(e)}",
@@ -641,22 +693,28 @@ class SlackEndpoint(Endpoint):
                         skip_timeout_error
                         and "invocation exited without response" in err_msg.lower()
                     ):
+                        self._clear_pending_message(client, channel, pending_ts)
                         return Response(
                             status=200,
                             response="ok",
                             content_type="text/plain",
                         )
                     else:
-                        # Send error message to Slack
-                        try:
-                            client.chat_postMessage(
-                                channel=channel,
-                                thread_ts=thread_ts,
-                                text=f"Sorry, I'm having trouble processing your request. Please try again later. Error: {err_msg}",
-                            )
-                        except SlackApiError:
-                            # Failed to send error message
-                            pass
+                        error_text = (
+                            "Sorry, I'm having trouble processing your request. "
+                            f"Please try again later. Error: {err_msg}"
+                        )
+                        if not self._update_pending_message(
+                            client, channel, pending_ts, f":warning: {error_text}"
+                        ):
+                            try:
+                                client.chat_postMessage(
+                                    channel=channel,
+                                    thread_ts=thread_ts,
+                                    text=error_text,
+                                )
+                            except SlackApiError:
+                                pass
 
                         return Response(
                             status=200,
